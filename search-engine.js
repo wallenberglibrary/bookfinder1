@@ -70,7 +70,7 @@
       "trauma":"trauma","healing":"healing","first love":"first love","betrayal":"betrayal",
       "power":"power","war":"war","magic":"magic","found family":"found family","love":"love",
       "class conflict":"class conflict","social class":"class conflict","rich and poor":"class conflict","class differences":"class conflict",
-      "myth":"myth","mythology":"myth","ethics":"ethics",
+      "myth":"myth","mythology":"myth","ethics":"morality","moral":"morality","morals":"morality","morality":"morality",
       // "secret" used to map only to "secret societies" (1 book); "secrets"
       // is the tag books actually carry (also covers "secret society").
       "secret":"secrets","secrets":"secrets",
@@ -202,7 +202,17 @@
   }
 
   function normalizeAuthor(a){
-    return (a || '').toLowerCase().replace(/[.,]+$/,'').trim();
+    // Records write the same author several ways ("Riordan, Rick.",
+    // "Riordan, Rick", "Rick Riordan."). Put them all in one form:
+    // "first last", lowercase, no punctuation, no birth/death years.
+    let s = (a || '').toLowerCase()
+      .replace(/\b\d{4}\s*-\s*(\d{4})?/g, ' ')
+      .replace(/\(.*?\)/g, ' ')
+      .replace(/\s+/g, ' ').trim();
+    const parts = s.split(',').map(x => x.replace(/[^a-z0-9' -]/g, ' ').replace(/\s+/g, ' ').trim()).filter(Boolean);
+    if (parts.length >= 2) s = parts[1] + ' ' + parts[0];
+    else s = (parts[0] || '');
+    return s.replace(/\s+/g, ' ').trim();
   }
 
   function isSameSeriesOrWork(refTitle, candidateTitle){
@@ -263,11 +273,22 @@
   // coincidence. Used only as a last resort, after media has a chance.
   function findReferenceBookLoose(ref, catalog){
     const refWords = ref.split(/\s+/).filter(w=>w.length>3);
+    if(!refWords.length) return null;
+    // Real bug (found comparing two schools): this used plain substring
+    // matching and accepted ONE shared word, so for a school that doesn't
+    // own the book, "something like james bond" latched onto "Vagabond"
+    // ("bond" inside "vagabond") and recommended whatever resembled
+    // THAT. Now: whole words only, and a multi-word reference must match
+    // most of its words (at least 2), so one coincidental shared word
+    // can never pick the reference book.
+    const esc = w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const wordRes = refWords.map(w => new RegExp('\\b' + esc(w) + 's?\\b'));
+    const needed = refWords.length === 1 ? 1 : Math.max(2, Math.ceil(refWords.length * 0.6));
     const wordCandidates = [];
     catalog.forEach(b=>{
       const t = b.title.toLowerCase();
-      const matches = refWords.filter(w=>t.includes(w)).length;
-      if(matches > 0) wordCandidates.push({book:b, score: matches});
+      const matches = wordRes.filter(re=>re.test(t)).length;
+      if(matches >= needed) wordCandidates.push({book:b, score: matches});
     });
     return wordCandidates.length ? pickBestBook(wordCandidates) : null;
   }
@@ -490,71 +511,80 @@
     const confidenceFilter = extractConfidenceFilter(rawQuery);
     const authorRegionFilter = extractAuthorRegionFilter(rawQuery);
 
-    let pool = CATALOG.filter(b=>b.available && (b.copies_available||0) > 0 && !excludeIds.has(b.id));
-    if(pageFilter){
-      pool = pool.filter(b=>b.page_count && b.page_count >= pageFilter.min && b.page_count <= pageFilter.max);
-    }
-    if(lexileFilter){
-      pool = pool.filter(b=>b.lexile_score && b.lexile_score >= lexileFilter.min && b.lexile_score <= lexileFilter.max);
-    }
-    if(confidenceFilter){
-      pool = pool.filter(b=>b.lexile_score && b.lexile_score >= confidenceFilter.min && b.lexile_score <= confidenceFilter.max);
-    }
-    if(authorRegionFilter){
-      if(authorRegionFilter.mode === 'include'){
-        if(authorRegionFilter.countryContains){
-          // Specific-country match, using the real author_country field —
-          // flexible (substring, case-insensitive) since Wikidata's exact
-          // label wording for a country isn't something to assume ("South
-          // Korea" vs "Korea", etc.).
-          const needle = authorRegionFilter.countryContains;
-          pool = pool.filter(b => b.author_country && b.author_country.toLowerCase().includes(needle));
-        } else {
-          // "European" is treated generously — a British author is also a
-          // reasonable answer to "European authors" for a student's purposes.
-          pool = pool.filter(b => b.author_region === authorRegionFilter.region ||
-            (authorRegionFilter.region === 'european' && b.author_region === 'british'));
-        }
-      } else {
-        // Exclusion only applies to CONFIRMED regions — a book whose author
-        // nationality we never resolved is left out entirely here too,
-        // rather than guessed as "probably fine." Same "don't recommend
-        // without confidence" principle used everywhere else in this tool.
-        pool = pool.filter(b => b.author_region && b.author_region !== authorRegionFilter.region);
+    // The same filters, series rule and scoring are applied to two disjoint
+    // sets of books: those on the shelf (the main results) and those not on
+    // the shelf right now (the optional second tab). Running ONE pipeline over
+    // both means the tab's contents and its count always agree, and a series
+    // is represented only by its true book 1 — in whichever set book 1 is in.
+    const isAvailable = b => b.available && (b.copies_available||0) > 0;
+    const runPool = (startPool) => {
+      let pool = startPool;
+      if(pageFilter){
+        pool = pool.filter(b=>b.page_count && b.page_count >= pageFilter.min && b.page_count <= pageFilter.max);
       }
-    }
-    pool = keepOnlyIfFirstVolumeAvailable(pool, CATALOG);
+      if(lexileFilter){
+        pool = pool.filter(b=>b.lexile_score && b.lexile_score >= lexileFilter.min && b.lexile_score <= lexileFilter.max);
+      }
+      if(confidenceFilter){
+        pool = pool.filter(b=>b.lexile_score && b.lexile_score >= confidenceFilter.min && b.lexile_score <= confidenceFilter.max);
+      }
+      if(authorRegionFilter){
+        if(authorRegionFilter.mode === 'include'){
+          if(authorRegionFilter.countryContains){
+            // Specific-country match, using the real author_country field —
+            // flexible (substring, case-insensitive) since Wikidata's exact
+            // label wording for a country isn't something to assume ("South
+            // Korea" vs "Korea", etc.).
+            const needle = authorRegionFilter.countryContains;
+            pool = pool.filter(b => b.author_country && b.author_country.toLowerCase().includes(needle));
+          } else {
+            // "European" is treated generously — a British author is also a
+            // reasonable answer to "European authors" for a student's purposes.
+            pool = pool.filter(b => b.author_region === authorRegionFilter.region ||
+              (authorRegionFilter.region === 'european' && b.author_region === 'british'));
+          }
+        } else {
+          // Exclusion only applies to CONFIRMED regions — a book whose author
+          // nationality we never resolved is left out entirely here too,
+          // rather than guessed as "probably fine." Same "don't recommend
+          // without confidence" principle used everywhere else in this tool.
+          pool = pool.filter(b => b.author_region && b.author_region !== authorRegionFilter.region);
+        }
+      }
+      pool = keepOnlyIfFirstVolumeAvailable(pool, CATALOG);
 
-    // AND, not OR, when the student's own query names 2+ tags in the SAME
-    // category ("funny AND quick", "fantasy heist", "female detective").
-    // A single matched tag stays permissive (scoring/ranking handles it),
-    // but once the query itself asks for a combination, a book missing
-    // half of it isn't a match — it just used to still score > 0 and rank
-    // in below the true matches, which is exactly backwards from what a
-    // multi-word descriptive query means.
-    const hasMultiTagFilter = ['genres', 'moods', 'themes', 'protagonist']
-      .some(cat => queryOnlyFound[cat].size >= 2);
-    if(hasMultiTagFilter){
-      pool = pool.filter(b => ['genres', 'moods', 'themes', 'protagonist'].every(cat => {
-        const required = queryOnlyFound[cat];
-        if(required.size < 2) return true; // not a multi-tag category, nothing to enforce here
-        const have = new Set((b[cat]||[]).map(s=>s.toLowerCase()));
-        return [...required].every(v => have.has(v.toLowerCase()));
-      }));
-    }
+      // AND, not OR, when the student's own query names 2+ tags in the SAME
+      // category ("funny AND quick", "fantasy heist", "female detective").
+      // A single matched tag stays permissive (scoring/ranking handles it),
+      // but once the query itself asks for a combination, a book missing
+      // half of it isn't a match — it just used to still score > 0 and rank
+      // in below the true matches, which is exactly backwards from what a
+      // multi-word descriptive query means.
+      const hasMultiTagFilter = ['genres', 'moods', 'themes', 'protagonist']
+        .some(cat => queryOnlyFound[cat].size >= 2);
+      if(hasMultiTagFilter){
+        pool = pool.filter(b => ['genres', 'moods', 'themes', 'protagonist'].every(cat => {
+          const required = queryOnlyFound[cat];
+          if(required.size < 2) return true; // not a multi-tag category, nothing to enforce here
+          const have = new Set((b[cat]||[]).map(s=>s.toLowerCase()));
+          return [...required].every(v => have.has(v.toLowerCase()));
+        }));
+      }
 
-    const hasHardFilter = !!(refBook || refMedia || pageFilter || lexileFilter || confidenceFilter || authorRegionFilter || hasMultiTagFilter);
-    const scored = pool
-      .map(b=>({book:b, score: (refBook || refMedia) ? scoreBook(b, found, rawQuery) + 0.01 : scoreBook(b, found, rawQuery)}))
-      .filter(x=>x.score > 0 || hasHardFilter)
-      .sort((a,b)=>b.score - a.score);
+      const hasHardFilter = !!(refBook || refMedia || pageFilter || lexileFilter || confidenceFilter || authorRegionFilter || hasMultiTagFilter);
+      const scored = pool
+        .map(b=>({book:b, score: (refBook || refMedia) ? scoreBook(b, found, rawQuery) + 0.01 : scoreBook(b, found, rawQuery)}))
+        .filter(x=>x.score > 0 || hasHardFilter)
+        .sort((a,b)=>b.score - a.score);
+      return scored;
+    };
 
-    const outOfStockMatches = CATALOG
-      .filter(b=>!(b.available && (b.copies_available||0) > 0) && !excludeIds.has(b.id))
-      .map(b=>({book:b, score:scoreBook(b, found, rawQuery)}))
-      .filter(x=>x.score > 0).length;
+    const scored = runPool(CATALOG.filter(b=>isAvailable(b) && !excludeIds.has(b.id)));
+    const unavailableScored = runPool(CATALOG.filter(b=>!isAvailable(b) && !excludeIds.has(b.id)));
+    // Kept for older callers: how many close matches are not on the shelf.
+    const outOfStockMatches = unavailableScored.length;
 
-    return { scored, found, refBook, refMedia, pageFilter, lexileFilter, confidenceFilter, authorRegionFilter, outOfStockMatches };
+    return { scored, unavailableScored, found, refBook, refMedia, pageFilter, lexileFilter, confidenceFilter, authorRegionFilter, outOfStockMatches };
   }
 
   return {
